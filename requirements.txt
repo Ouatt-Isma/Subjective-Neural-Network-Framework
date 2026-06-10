@@ -1,0 +1,6 @@
+torch>=2.0
+numpy>=1.23
+scipy>=1.9
+# for real frozen-backbone features (not needed for --backbone synthetic):
+torchvision>=0.15
+timm>=0.9          # only if using a timm backbone instead of dinov2
