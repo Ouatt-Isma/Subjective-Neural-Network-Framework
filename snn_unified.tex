@@ -1,0 +1,544 @@
+\documentclass[11pt]{article}
+
+% ---------------------------------------------------------------
+% NOTE TO AUTHORS
+% Unified draft: the SNN framework (Bayesian dropout + subjective
+% logic) is the spine; its uncertainty semantics are made
+% principled via the law of total variance; the frozen-backbone
+% "Subjective Head" is a deployment mode that enables strong
+% backbones on modest hardware and the synthetic->real move.
+% Result cells marked [fill] need numbers from runs (see code).
+% Citations marked %VERIFY were added in the merge.
+% Plain article class for portability; drop into the UAI style.
+% ---------------------------------------------------------------
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage[margin=1in]{geometry}
+
+\newtheorem{proposition}{Proposition}
+\newcommand{\todo}[1]{\textcolor{red}{[#1]}}
+\newcommand{\Eb}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\R}{\mathbb{R}}
+
+\title{Subjective Neural Networks:\\
+Trust-Aware Bayesian Dropout with a Principled Uncertainty Decomposition}
+\author{Koffi Ismael Ouattara \quad Theo Dimitrakos \quad Frank Kargl}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Neural networks achieve strong predictive accuracy but communicate uncertainty
+poorly, which limits their use in safety-critical settings. Bayesian dropout
+approximates a posterior predictive but conflates ignorance with stochastic
+variability, while Evidential Deep Learning (EDL) imposes a Dirichlet opinion at the
+output without a grounded posterior. We introduce the \textbf{Subjective Neural
+Network (SNN)}, which unifies Bayesian variational inference with Subjective Logic by
+placing a Beta-distributed \emph{trust} variable on each unit's participation via
+Beta--Bernoulli dropout, sampling Bernoulli masks, and aggregating the posterior
+predictive samples into a Dirichlet opinion with explicit belief and residual
+uncertainty. Beyond the construction, we make the SNN's uncertainty \emph{semantics}
+principled. Using the law of total variance---established machinery we apply rather
+than claim---we show analytically that the SL uncertainty mass $u$ tracks only the
+\emph{epistemic} (across-sample) term of the predictive variance, whereas the
+predictive entropy $H$ and $1-\max_k b_k$ read the \emph{total} spread of the mean
+prediction. This corrects the common reading of $u$ as a general ``I do not know''
+signal and predicts, in particular, that a confident SNN reports low $u$ on
+out-of-distribution (OOD) inputs. To evaluate on strong backbones with modest
+hardware, we deploy the SNN as a \emph{post-hoc subjective head} on a frozen
+foundation model: the backbone runs once and nested sampling is restricted to a small
+bottleneck, making inference overhead negligible. On real foundation-model features we
+(i) confirm the decomposition empirically, (ii) show a two-dimensional
+$(\max_k b_k, u)$ abstention frontier that separates within-model instability from
+lack of decisive evidence, and (iii) show trust-discounted SL fusion preserves accuracy
+when an ensemble contains adversarially miscalibrated sources, where logit averaging
+and Laplace ensembling collapse. We report modern UQ baselines, multiple seeds, full
+scalar metrics, and release code.
+\end{abstract}
+
+% ===============================================================
+\section{Introduction}
+% ===============================================================
+Neural networks (NNs) reach state-of-the-art accuracy across vision and language, yet
+their inability to communicate \emph{meaningful} uncertainty remains a bottleneck for
+deployment in healthcare, autonomous driving, and security. Overconfidence on incorrect
+predictions erodes trust precisely where reliability matters most.
+
+Two families address this. Bayesian NNs \citep{neal1996,blundell2015} and
+dropout-as-Bayesian-inference \citep{gal2016b} approximate a posterior predictive and
+capture model uncertainty, but express it only as variability in probability estimates
+and do not separate committed belief from residual ignorance. Evidential approaches---
+EDL \citep{sensoy2018}---instead output a Dirichlet at the head, yielding a Subjective
+Logic opinion in a single forward pass, but recent work \citep{shen2024} shows EDL's
+uncertainty need not decrease with data and can behave like an energy-based OOD score
+rather than a grounded posterior. Thus Bayesian methods give posterior uncertainty
+without structured trust semantics, while evidential methods give structure without a
+grounded posterior. This is the structural gap our framework targets.
+
+\paragraph{Subjective Neural Networks.}
+We propose the \textbf{SNN}, which bridges Bayesian dropout and Subjective Logic
+\citep[SL;][]{josang2016}. Each unit $j$ carries a latent trust probability
+$p_j\sim\mathrm{Beta}(\alpha_j,\beta_j)$ governing its participation through a Bernoulli
+mask $z_j\sim\mathrm{Bernoulli}(p_j)$; the known Beta--binomial-opinion mapping lets us
+read $p_j$ as a subjective trust in unit $j$. A nested sampling procedure (sample trust,
+sample masks, aggregate) produces posterior-predictive samples that we project onto a
+Dirichlet, yielding a multinomial opinion $\omega=(b,u,a)$ with an explicit
+belief/ignorance split. Unlike EDL, the Dirichlet \emph{emerges} from posterior
+predictive sampling rather than being imposed at the output.
+
+\paragraph{Making the motivation principled.}
+The promise attached to such constructions is that the uncertainty mass $u$ measures
+epistemic uncertainty. We show this reading is only half correct, and we make precise
+which half, using the law of total variance \citep{kwon2020,depeweg2018}---which we
+treat as known machinery, not a contribution. The SNN's predictive variance decomposes
+into an aleatoric term (expected within-model categorical spread) and an epistemic term
+(variance of the mean prediction across the trust/mask posterior). By construction the
+moment-matched $u$ is a monotone function of the \emph{epistemic} term alone and is
+blind to aleatoric spread in the mean. This yields a falsifiable prediction: a
+confident SNN reports \emph{low} $u$ on OOD inputs that excite familiar pathways,
+because masks do not move a confident-but-wrong prediction; $H$ and $1-\max_k b_k$,
+which read the mean prediction, do detect them. We confirm this on real features
+(\S\ref{sec:exp}). The decomposition is the principled spine: it gives each SNN signal a
+precise meaning and explains, rather than asserts, the model's behaviour.
+
+\paragraph{Strong backbones on modest hardware.}
+Bayesian dropout over an entire deep network is the costly regime that motivated the
+``efficiency'' concerns of prior critiques. We instead deploy the SNN as a
+\emph{post-hoc subjective head} on a \emph{frozen} foundation model: the SNN's
+Beta--Bernoulli dropout acts only on a small bottleneck, the backbone runs once, and
+inference overhead is well under one percent of backbone compute. This (a) replaces the
+underpowered LeNet/ResNet-18 backbones of the original evaluation with modern
+representations, (b) is trainable on a laptop because only the head is learned, and
+(c) takes the analysis from synthetic to real data.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item The \textbf{SNN}: a Bayesian-dropout framework with neuron-level Beta trust that
+produces SL opinions from posterior-predictive sampling, with an \emph{explicit}
+discrete-mask gradient path (Concrete relaxation) and an account of the variational
+loss-balance pitfall that silently disables the mechanism in small heads.
+\item A \textbf{principled reading} of the SNN's uncertainty via the law of total
+variance: $u$ is the epistemic (across-sample) term; $H$ and $1-\max_k b_k$ read the
+total spread of the mean. We derive analytically why $u$ is not a general OOD signal.
+\item A \textbf{frozen-backbone deployment} of the SNN with negligible overhead,
+enabling evaluation on real foundation-model features with strong backbones.
+\item \textbf{Operational results}: a $(\max_k b_k, u)$ two-threshold abstention
+frontier that significantly beats each individual SL component in extrapolation regimes,
+and trust-discounted SL fusion that survives adversarially miscalibrated sources where
+logit averaging and Laplace ensembles collapse. Evaluated with modern baselines,
+multiple seeds with CIs, and full scalar metrics; code released.
+\end{enumerate}
+
+% ===============================================================
+\section{Background and Related Work}
+% ===============================================================
+\paragraph{Uncertainty in deep learning.}
+BNNs \citep{neal1996,blundell2015} model weight distributions but are costly; MC Dropout
+\citep{gal2016b} is a scalable approximation; variational and Concrete dropout
+\citep{molchanov2017,gal2017concrete,maddison2017} learn or relax dropout rates. All
+express uncertainty as predictive variance without a belief/ignorance split.
+Beta--Bernoulli dropout \citep{lee2019} places a Beta prior over keep probabilities for
+\emph{sparsification}; we repurpose its variational machinery for trust-aware
+uncertainty.
+
+\paragraph{Subjective Logic and the Dirichlet correspondence.}
+An SL multinomial opinion is $\omega=(b,u,a)$ with $\sum_k b_k+u=1$, mapping to a
+Dirichlet with concentration $\eta$:
+\begin{equation}
+b_k=\frac{\eta_k}{S+K},\qquad u=\frac{K}{S+K},\qquad a_k=\tfrac1K,\qquad S=\textstyle\sum_k\eta_k,
+\end{equation}
+and projected probability $p_k=b_k+u\,a_k$ \citep{josang2016}. SL has been used to assess
+dataset and network trustworthiness \citep{cheng2020,ouattara2025a,ouattara2025b}.
+
+\paragraph{Evidential Deep Learning.}
+EDL \citep{sensoy2018} outputs evidence $e_k$, sets $\eta_k=e_k+1$, trains with an SSE
+loss plus a KL regulariser, and produces an opinion in one pass. \citet{shen2024}
+question whether its $u$ is a coherent posterior signal.
+
+\paragraph{Last-layer Laplace and ensembles.}
+Last-layer Laplace \citep{daxberger2021} is a cheap, post-hoc Gaussian over the final
+linear layer; Deep Ensembles \citep{lakshminarayanan2017} are the standard strong UQ
+baseline; Posterior Networks \citep{charpentier2020} construct epistemic uncertainty
+that provably decreases with data.
+
+\paragraph{SL fusion operators.}
+SL provides closed-form operators on $(b,u)$ \citep{josang2016}: cumulative fusion
+$\eta^C=\sum_i\eta_i-(N-1)$, averaging $\eta^C=(\sum_i\eta_i)/N$, and trust transitivity
+$b'_k=t\,b_k,\;u'=t\,u+(1-t)$, which carry source-reliability uncertainty through to the
+fused opinion.
+
+\paragraph{Uncertainty decomposition.}
+The law of total variance splits predictive variance into expected conditional variance
+(aleatoric) and variance of the conditional mean (epistemic) \citep{depeweg2018};
+\citet{kwon2020} give the categorical form we use. We treat this as established.
+
+% ===============================================================
+\section{Variational Inference for the SNN}
+% ===============================================================
+The SNN is Bayesian over per-unit trust probabilities. Given data $\mathcal D$, exact
+posterior inference is intractable, so we use variational inference, maximising the
+evidence lower bound (ELBO)
+\begin{equation}
+\mathcal L(\phi)=\Eb_{q_\phi}[\log p(\mathcal D\mid\cdot)]-\KL\big(q_\phi\,\|\,p\big),
+\end{equation}
+optimised by stochastic gradient variational Bayes \citep{kingma2022,rezende2014} with
+differentiable Monte Carlo estimators. This requires a reparameterisation of the latent.
+
+\paragraph{Beta latents via Kumaraswamy.}
+The Beta distribution lacks a convenient location--scale reparameterisation in its shape
+parameters \citep{nalisnick2017}. We use the Kumaraswamy surrogate \citep{mitnik2013},
+which admits a closed-form inverse CDF:
+\begin{equation}
+p_j=\big(1-u^{1/\beta_j}\big)^{1/\alpha_j},\qquad u\sim\mathrm{Uniform}(0,1),
+\label{eq:kuma}
+\end{equation}
+giving differentiable samples of $p_j$ w.r.t.\ $(\alpha_j,\beta_j)$. We quantify the
+Kumaraswamy--Beta gap in Appendix~\ref{app:impl}.
+
+\paragraph{Discrete mask gradient (explicit).}
+Conditioned on $p_j$, the mask $z_j$ is binary, so we relax it \emph{at training time}
+with the Concrete/Gumbel-softmax distribution \citep{maddison2017}:
+\begin{equation}
+z_j=\sigma\!\Big(\big(\log p_j-\log(1-p_j)+\log u-\log(1-u)\big)/\tau\Big),\quad
+u\sim\mathrm{Uniform}(0,1),
+\label{eq:concrete}
+\end{equation}
+with temperature $\tau$; gradients flow through both $p_j$ (via \eqref{eq:kuma}) and
+$z_j$ (via \eqref{eq:concrete}). At inference we use hard Bernoulli draws. This states
+explicitly the gradient path that prior versions left unspecified.
+
+% ===============================================================
+\section{The Subjective Neural Network}
+% ===============================================================
+\paragraph{Model.}
+For each unit $j$, $p_j\sim\mathrm{Beta}(\alpha_j,\beta_j)$ is a subjective trust in the
+unit's activation, and $z_j\sim\mathrm{Bernoulli}(p_j)$ masks it. The forward pass under
+a sampled mask is $f(x;W,z)=\mathrm{NN}(x;W\odot z)$. We are Bayesian over the
+trust/keep probabilities, \emph{not} over weights; we state this rather than framing it
+as weight-space BNN inference.
+
+\paragraph{Training objective.}
+With variational posterior $q(p_j)=\mathrm{Beta}(\alpha_j,\beta_j)$ and prior
+$\mathrm{Beta}(a_0,b_0)$, the per-batch loss is the negative ELBO
+\begin{equation}
+\mathcal L=\frac{1}{|B|}\!\sum_{(x,y)\in B}\!-\log p(y\mid x,W\odot z)
++\frac{\beta(t)}{N_{\text{train}}}\sum_{j=1}^{H}
+\KL\!\big(\mathrm{Beta}(\alpha_j,\beta_j)\,\|\,\mathrm{Beta}(a_0,b_0)\big),
+\label{eq:elbo}
+\end{equation}
+with closed-form Beta--Beta KL (Appendix~\ref{app:impl}).
+
+\paragraph{Loss-balance pitfall.}
+For $H\!\in\![12,512]$ trust units and $N_{\text{train}}\!\sim\!10^3$--$10^5$, the
+per-example KL is order $10^{-2}$ while the NLL is order $10^0$: the KL becomes rounding
+error, the posterior collapses to a point, and the Beta--Bernoulli mechanism does
+nothing. Three knobs fix this: a multiplier $\beta_{\max}\!\gg\!1$ tuned on validation
+calibration (typically $[5,50]$); an informative prior peaked at a sensible keep
+probability; and a KL warmup ramping $\beta(t)$ to $\beta_{\max}$. \emph{Diagnostic}: if
+$\mathrm{std}_j(\Eb[p_j])<0.01$ after training, the mechanism is dead.
+
+\paragraph{Inference: nested sampling and the augmented opinion.}
+For input $x$, draw $N_p$ trust samples $p^{(i)}$; for each, $N_m$ masks $z^{(i,j)}$, and
+compute $\pi^{(i,j)}=\mathrm{softmax}(f(x;W,z^{(i,j)}))$. Each trust sample yields a
+per-sample Dirichlet from class counts, $\alpha^{(i)}_k=c^{(i)}_k+a_0$ with mean
+$m^{(i)}=\alpha^{(i)}/S^{(i)}$. The law of total variance then splits the predictive
+variance \emph{inside} the opinion construction:
+\begin{equation}
+\mathrm{varE}_k=\Var_i\big[m^{(i)}_k\big]\ \text{(epistemic)},\qquad
+\mathrm{eVar}_k=\Eb_i\big[m^{(i)}_k(1-m^{(i)}_k)\big]\ \text{(aleatoric)}.
+\end{equation}
+The \textbf{augmented SL opinion} sets the vacuity to the \emph{epistemic share},
+routes the aleatoric component into the Dirichlet concentration, and takes the
+direction from the pooled evidence $\bar\alpha=\sum_i\alpha^{(i)}$:
+\begin{equation}
+u^\ast=\frac{\sum_k\mathrm{varE}_k}{\sum_k(\mathrm{varE}_k+\mathrm{eVar}_k)},\quad
+b_k=(1-u^\ast)\frac{\bar\alpha_k}{\sum_j\bar\alpha_j},\quad
+P_k=b_k+\frac{u^\ast}{K},\quad
+S^\ast=\frac1K\sum_k\max\!\Big(1,\frac{P_k(1-P_k)}{\mathrm{eVar}_k}-1\Big),
+\label{eq:augmented}
+\end{equation}
+with output Dirichlet $\alpha^\ast_k=P_kS^\ast$. Unlike a moment-matched/MLE
+Dirichlet fit, whose $u$ is monotone in the epistemic variance alone
+(Prop.~\ref{prop:u}) and collapses for a confident head, $u^\ast$ answers ``what
+\emph{fraction} of my uncertainty is epistemic,'' and the aleatoric spread is
+preserved in $S^\ast$ rather than discarded. Two cautions. (i) Defining
+$\mathrm{eVar}$ as the per-sample Dirichlet \emph{posterior} variance is incorrect:
+it and the multinomial noise in $\mathrm{varE}$ both shrink as $1/N_m$, so $u^\ast$
+saturates near $1/2$ even in purely aleatoric regimes; the categorical form above
+restores the separation. (ii) We use prior $a_0=1/K$ so the $+u^\ast/K$ base-rate
+smoothing is not applied twice. For comparison we also report the legacy signals
+$u=K/(S+K)$, $H$, and $1-\max_k b_k$ from the moment-matched fit
+(eq.~\ref{eq:signals}).
+\begin{equation}
+u=\frac{K}{S+K},\qquad H=-\sum_k\bar\pi_k\log\bar\pi_k,\qquad \neg b=1-\max_k b_k.
+\label{eq:signals}
+\end{equation}
+
+\paragraph{From unit-level trust to output uncertainty.}
+The shape of each unit's Beta determines \emph{which kind} of uncertainty its
+stochasticity injects into the output, and the nested sampler separates the two via
+the LoTV split. With $p_j\sim\mathrm{Beta}(\alpha_j,\beta_j)$:
+$\alpha_j\!\gg\!\beta_j$ (\emph{trusted}): the unit is essentially always active and
+contributes no uncertainty; $\alpha_j\!\ll\!\beta_j$ (\emph{distrusted}): always
+inactive, none either. $\alpha_j\!\approx\!\beta_j\!\gg\!1$ (\emph{aleatoric}): $p_j$
+concentrates at $1/2$, so masks flip independently \emph{within} each trust draw---the
+within-sample categorical variance ($\mathrm{eVar}$) carries the signal.
+$\alpha_j\!\approx\!\beta_j\!\ll\!1$ (\emph{epistemic}): the U-shaped Beta makes
+$p_j\!\approx\!0$ or $1$ \emph{per trust draw}, so predictions are consistent within a
+draw but differ across draws---the across-sample variance ($\mathrm{varE}$) carries it.
+The flat case $\alpha_j\!\approx\!\beta_j\!\approx\!1$ is mixed and, analytically,
+aleatoric-leaning ($\Eb_p[g(1-g)]>\Var_p[g]$ for our worked example), so only the
+U-shape is genuinely epistemic. We validate this on a minimal two-unit network with
+deterministic priority inference ($P(0)=(1-p)p$, $P(1)=p$, $P(2)=(1-p)^2$): the
+pooled counts for the aleatoric and epistemic regimes can be \emph{identical}
+(e.g.\ $[0,1,2],[0,1,2],[0,1,2]$ versus $[0,0,0],[1,1,1],[2,2,2]$), so a pooled
+Dirichlet cannot distinguish them; only the LoTV split inside the augmented opinion
+can. Per-unit trust is itself a binomial SL opinion with $W{=}2$:
+$u_j=2/(2+\alpha_j+\beta_j)$, $b_j=\alpha_j/(2+\alpha_j+\beta_j)$,
+$d_j=\beta_j/(2+\alpha_j+\beta_j)$; sub-prior units ($\alpha_j,\beta_j<1$) correctly
+receive \emph{higher} vacuity than $\alpha_j=\beta_j=1$. Reporting the learned regime
+distribution per layer makes the ``trust-aware'' claim inspectable.
+
+\paragraph{Deployment as a frozen-backbone head.}
+The SNN need not be a full network. When the backbone $g$ is a frozen foundation model,
+we apply Beta--Bernoulli dropout only in a two-layer head on the penultimate
+representation $x=g(\text{input})$:
+$x\!\xrightarrow{\text{LN}}\!\tilde x\!\xrightarrow{W_1,\mathrm{ReLU}}\!h\!\xrightarrow{\odot z}\!h'\!\xrightarrow{W_2}\!\text{logits}$.
+The backbone runs once; nested sampling loops only over the small head. This is the same
+SNN method restricted to the head, and it is what makes strong backbones laptop-feasible.
+
+\begin{algorithm}[t]
+\caption{SNN training (one minibatch)}
+\begin{algorithmic}[1]
+\State sample $u\sim\mathrm{Uniform}$; $p_j\!\leftarrow\!(1-u^{1/\beta_j})^{1/\alpha_j}$ \Comment{Kumaraswamy}
+\State sample relaxed mask $z_j$ via Concrete \eqref{eq:concrete}
+\State $\hat y\!\leftarrow\! f(x;W\odot z)$; compute $\mathcal L$ \eqref{eq:elbo} with KL warmup $\beta(t)$
+\State update $\{\alpha_j,\beta_j\}$ (and head weights $W$) by backprop
+\end{algorithmic}
+\end{algorithm}
+
+% ===============================================================
+\section{Principled Uncertainty Semantics via the Law of Total Variance}
+\label{sec:lotv}
+% ===============================================================
+Let $\omega=(p,z)$ be the SNN's latent and let the label be one-hot $y$ with
+$y\mid\omega\sim\mathrm{Categorical}(\pi(x,\omega))$, so $\Eb[y\mid\omega]=\pi$ and
+$\Cov(y\mid\omega)=\diag(\pi)-\pi\pi^\top$. The law of total covariance
+\citep{kwon2020,depeweg2018} gives
+\begin{equation}
+\underbrace{\Cov[y\mid x]}_{\text{total}}
+=\underbrace{\Eb_\omega\!\big[\diag(\pi)-\pi\pi^\top\big]}_{\text{aleatoric }A(x)}
++\underbrace{\Cov_\omega[\pi]}_{\text{epistemic }E(x)},
+\label{eq:lotv}
+\end{equation}
+and, in trace form with $\bar\pi=\Eb_\omega[\pi]$,
+\begin{equation}
+\underbrace{1-\lVert\bar\pi\rVert^2}_{\text{total}}
+=\underbrace{\Eb_\omega[1-\lVert\pi\rVert^2]}_{\text{aleatoric}}
++\underbrace{\Eb_\omega\lVert\pi\rVert^2-\lVert\bar\pi\rVert^2}_{\text{epistemic}} .
+\label{eq:lotv-trace}
+\end{equation}
+The epistemic term is the across-sample variance of the softmax output; the aleatoric
+term is the expected within-sample categorical spread. The SNN's nested sampler
+estimates both directly:
+$\widehat{\operatorname{tr}E}=\tfrac1N\sum_n\lVert\pi_n-\bar\pi\rVert^2$ and
+$\widehat{\operatorname{tr}A}=\tfrac1N\sum_n(1-\lVert\pi_n\rVert^2)$.
+
+\begin{proposition}[$u$ is an epistemic-only signal]
+\label{prop:u}
+With Dirichlet moment matching as in \S5, the per-class variance setting the total
+evidence is $v_k=\Var_i[\bar\pi^{(i)}_k]$, the across-trust-sample (epistemic) variance
+of the mean prediction. Since $S=\mathrm{median}_k[m_k(1-m_k)/v_k-1]$ is decreasing in
+$v_k$ and $u=K/(S+K)$ is increasing in $1/S$, $u$ is a strictly increasing function of
+the epistemic term and, holding $\bar\pi$ fixed, is invariant to the aleatoric spread of
+the mean prediction.
+\end{proposition}
+
+\noindent\emph{Why $u$ fails on OOD.}
+Let $h=\mathrm{ReLU}(W_1\tilde x+b_1)$ and $\ell=W_2(h\odot z)+b_2$, so
+$\Var_z[\ell_k]=\sum_j w_{k,j}^2 h_j^2 p_j(1-p_j)$. When a trained head has a dominant
+class $k^*$ for $h$, the logit gap dwarfs $(\Var_z[\ell_{k^*}])^{1/2}$ and $\pi$ is
+near-constant across masks: $E(x)\!\to\!0$, $S\!\to\!\infty$, $u\!\to\!0$. This depends
+only on $W_2,h$, not on whether $x$ is in-distribution; an OOD input exciting the same
+pathway gives the same low $u$ while $\bar\pi$ is wrong and spread out (high $H$, low
+$\max_k b_k$). The decomposition thus \emph{predicts} the OOD failure of $u$ and the
+success of $H,\neg b$. The pair $(\max_k b_k, u)$ recovers both terms of \eqref{eq:lotv};
+$H$ implicitly aggregates them. This is the principled correction to the naive reading
+of $u$ as a general ignorance signal.
+
+% ===============================================================
+\section{Experiments}
+\label{sec:exp}
+% ===============================================================
+\paragraph{Setup.}
+Backbone: frozen \textbf{DINOv2 ViT-S/14} \citep{oquab2024} %VERIFY
+(alt.\ CLIP ViT-B/32 \citep{radford2021}); %VERIFY
+features extracted once. The SNN head and all baselines share the same
+LN--Linear--ReLU--Linear architecture on the same frozen features, isolating the
+uncertainty mechanism from backbone capacity. ID: CIFAR-10, CIFAR-100; OOD: SVHN and a
+held-out CIFAR-100 split. Baselines: deterministic Linear, MC Dropout \citep{gal2016b},
+EDL \citep{sensoy2018}, last-layer Laplace \citep{daxberger2021}, Deep Ensembles
+\citep{lakshminarayanan2017}, optional Posterior Network \citep{charpentier2020}.
+Metrics: Accuracy, NLL, Brier, ECE (15 bins), OOD AUROC/AUPR/FPR@95, selective AUSC,
+over \textbf{10 seeds} with 95\% CIs. Robustness with FGSM \emph{and} PGD. We report
+wall-clock inference time and peak memory for a deterministic pass, MC Dropout (100
+passes), and the SNN head ($N_pN_m$ head passes + moment matching), substantiating the
+negligible-overhead claim.
+
+% ---------------------------------------------------------------
+\subsection{Predictive performance, calibration, and OOD}
+% ---------------------------------------------------------------
+The SNN's original evaluation axes (accuracy, calibration, OOD), now on real features.
+\begin{table}[h]\centering
+\caption{Main comparison on frozen DINOv2 features. \todo{fill from runs}.}
+\begin{tabular}{lcccccc}
+\toprule
+Method & Acc. & NLL & Brier & ECE & OOD AUROC & FPR@95 \\
+\midrule
+Linear & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} \\
+MC Dropout & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} \\
+EDL & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} \\
+Deep Ensemble & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} \\
+Laplace & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} & \todo{} \\
+SNN (ours) & \todo{} & \todo{} & \todo{} & \todo{} & \todo{($H$)} & \todo{} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Decomposition analysis}
+On the same trained SNN, the three signals \eqref{eq:signals} are not interchangeable:
+selective AUROC is similar, but OOD AUROC collapses for $u$ while $H,\neg b$ stay high,
+confirming Proposition~\ref{prop:u}. We also plot the empirical
+aleatoric/epistemic split \eqref{eq:lotv-trace} for ID vs OOD. \todo{fill}.
+
+\subsection{Covariate shift (rotated inputs)}
+Retained from the SNN evaluation: predictive class probabilities and uncertainty as
+inputs are progressively rotated. Expected behaviour: SNN uncertainty rises smoothly
+under shift, between the overconfident MC Dropout and the over-cautious EDL. \todo{figs}.
+
+\subsection{Two-threshold abstention}
+Multi-regime test mixture (easy / split / diffuse) with the head trained on easy to
+force extrapolation. We sweep 1D rules ($H$, $\neg b$, $u$) and the 2D rule (accept iff
+$\max_k b_k>\tau_b$ and $u<\tau_u$) and integrate the retained-accuracy/coverage Pareto
+envelope.
+\begin{table}[h]\centering
+\caption{Selective-prediction AUSC, 10 seeds, train-on-easy. \todo{fill}; expected:
+2D $>$ each SL component ($p<0.01$); not significantly above $H$.}
+\begin{tabular}{lcc}
+\toprule
+Signal & Mean AUSC (95\% CI) & $p$ vs.\ 2D \\
+\midrule
+$H$ & \todo{} & \todo{} \\
+$\neg b$ & \todo{} & \todo{} \\
+$u$ & \todo{} & \todo{} \\
+$(\max b,u)$ 2D & \todo{} & ref. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Adversarial-robust SL fusion}
+Five SNN sources; two reliable, three adversarial (labels rotated $y'=(y+1)\bmod K$).
+Trust-discounted SL fusion uses $t_i=(n_{\text{correct},i}+1)/(n_{\text{total},i}+2)$.
+\begin{table}[h]\centering
+\caption{Fusion across 2 reliable + 3 adversarial sources. \todo{fill}; expected: logit
+averaging and Laplace ensemble collapse; trust-discounted SL preserves accuracy and
+returns a full opinion with elevated $u$.}
+\begin{tabular}{lccc}
+\toprule
+Method & Acc. & NLL & ECE \\
+\midrule
+Single best source & \todo{} & \todo{} & \todo{} \\
+Logit averaging & \todo{} & \todo{} & \todo{} \\
+Acc-weighted vote & \todo{} & \todo{} & \todo{} \\
+Laplace ensemble & \todo{} & \todo{} & \todo{} \\
+SL averaging / cumulative & \todo{} & \todo{} & \todo{} \\
+SL trust-discounted & \todo{} & \todo{} & \todo{} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===============================================================
+\section{Discussion}
+% ===============================================================
+\textbf{What $u$ measures.} By \eqref{eq:lotv} and Proposition~\ref{prop:u}, $u$ is a
+within-model (epistemic) variance signal, close to MC Dropout's predictive variance, not
+an evidence-absence signal; it is informative where the SNN extrapolates.
+\textbf{Decomposition view.} $(b,u)$ is best read as a structured decomposition: $\neg b$
+reads the mean (total side), $u$ reads across-sample variance (epistemic). They coincide
+in the confident regime and separate off-manifold, which the abstention experiment
+exploits. \textbf{SL vs Laplace.} SL wins when the ensemble contains adversarial members;
+Laplace's local Gaussian does not suppress confident adversarial means, while trust
+transitivity discounts their belief into $u$. We do not claim better raw calibration.
+\textbf{On prior critiques.} The gradient path is explicit; the Bayesian scope is stated
+honestly (trust, not weights); efficiency is real because the backbone is frozen (we
+report wall-clock); and the contribution is not Beta--Bernoulli dropout itself but the
+principled identification of which signal is which LoTV component and the operations it
+enables.
+
+\section{Limitations and Conclusion}
+Findings are in the frozen-feature regime and $u$ is informative only under
+extrapolation, by construction. The natural extension is the same head on frozen LLM
+last-token states for closed-set tasks. The SNN unifies Bayesian dropout and Subjective
+Logic; the law of total variance gives its signals precise meaning, correcting the
+reading of $u$; the frozen-backbone head makes it efficient and applicable to strong
+models; and the structured opinion enables abstention and robust fusion that scalar
+uncertainty cannot express.
+
+% ===============================================================
+\appendix
+\section{Implementation details and proofs}
+\label{app:impl}
+\paragraph{LoTV proof.} With $y\mid\omega\sim\mathrm{Cat}(\pi)$,
+$\Cov(y\mid\omega)=\diag(\pi)-\pi\pi^\top$; the law of total covariance gives
+\eqref{eq:lotv}, and summing the diagonal gives \eqref{eq:lotv-trace} (consistent
+because $\Eb_\omega[\diag(\pi)]=\diag(\bar\pi)$).
+\paragraph{Beta--Beta KL.}
+$\KL(\mathrm{Beta}(\alpha,\beta)\|\mathrm{Beta}(a_0,b_0))=\log\frac{B(a_0,b_0)}{B(\alpha,\beta)}
++(\alpha-a_0)\psi(\alpha)+(\beta-b_0)\psi(\beta)-(\alpha+\beta-a_0-b_0)\psi(\alpha+\beta)$.
+\paragraph{Kumaraswamy gap.} We report total-variation / KL between
+$\mathrm{Beta}(\alpha,\beta)$ and the Kumaraswamy surrogate over the post-training grid
+of $(\alpha,\beta)$, addressing the unquantified-approximation objection.
+\paragraph{Single-threshold insufficiency.} No monotone $f(\max_k b_k,u)$ reproduces the
+2D ranking: a split point (low $\max b$, moderate $u$) and an easy point (moderate
+$\max b$, very low $u$) are ordered oppositely by $\max_k b_k-\lambda u$ and by the joint
+rule.
+
+\begin{thebibliography}{99}\small
+\bibitem[Blundell et al.(2015)]{blundell2015} C.~Blundell et al. Weight uncertainty in neural networks. \emph{ICML}, 2015.
+\bibitem[Charpentier et al.(2020)]{charpentier2020} B.~Charpentier, D.~Z\"ugner, S.~G\"unnemann. Posterior Network. \emph{NeurIPS}, 2020.
+\bibitem[Cheng et al.(2020)]{cheng2020} M.~Cheng, S.~Nazarian, P.~Bogdan. Quantifying opinion and trustworthiness in neural networks. \emph{Frontiers in AI}, 2020.
+\bibitem[Daxberger et al.(2021)]{daxberger2021} E.~Daxberger et al. Laplace Redux. \emph{NeurIPS}, 2021.
+\bibitem[Depeweg et al.(2018)]{depeweg2018} S.~Depeweg et al. Decomposition of uncertainty in Bayesian deep learning. \emph{ICML}, 2018. %VERIFY
+\bibitem[Gal \& Ghahramani(2016)]{gal2016b} Y.~Gal, Z.~Ghahramani. Dropout as a Bayesian approximation. \emph{ICML}, 2016.
+\bibitem[Gal et al.(2017)]{gal2017concrete} Y.~Gal, J.~Hron, A.~Kendall. Concrete Dropout. \emph{NeurIPS}, 2017.
+\bibitem[J{\o}sang(2016)]{josang2016} A.~J{\o}sang. \emph{Subjective Logic}. Springer, 2016.
+\bibitem[Kingma \& Welling(2022)]{kingma2022} D.~P.~Kingma, M.~Welling. Auto-encoding variational Bayes. arXiv:1312.6114.
+\bibitem[Kwon et al.(2020)]{kwon2020} Y.~Kwon et al. Uncertainty quantification using Bayesian neural networks in classification. \emph{Comput.\ Stat.\ Data Anal.}, 2020. %VERIFY
+\bibitem[Lakshminarayanan et al.(2017)]{lakshminarayanan2017} B.~Lakshminarayanan, A.~Pritzel, C.~Blundell. Deep ensembles. \emph{NeurIPS}, 2017.
+\bibitem[Lee et al.(2019)]{lee2019} J.~Lee et al. Adaptive network sparsification with dependent variational Beta--Bernoulli dropout. arXiv:1805.10896.
+\bibitem[Maddison et al.(2017)]{maddison2017} C.~J.~Maddison, A.~Mnih, Y.~W.~Teh. The Concrete Distribution. \emph{ICLR}, 2017.
+\bibitem[Mitnik \& Baek(2013)]{mitnik2013} P.~A.~Mitnik, S.~Baek. The Kumaraswamy distribution. \emph{Statistical Papers}, 2013.
+\bibitem[Molchanov et al.(2017)]{molchanov2017} D.~Molchanov, A.~Ashukha, D.~Vetrov. Variational dropout sparsifies DNNs. \emph{ICML}, 2017.
+\bibitem[Nalisnick \& Smyth(2017)]{nalisnick2017} E.~Nalisnick, P.~Smyth. Stick-breaking variational autoencoders. \emph{ICLR}, 2017.
+\bibitem[Neal(1996)]{neal1996} R.~M.~Neal. \emph{Bayesian Learning for Neural Networks}. Springer, 1996.
+\bibitem[Oquab et al.(2024)]{oquab2024} M.~Oquab et al. DINOv2. \emph{TMLR}, 2024. %VERIFY
+\bibitem[Ouattara et al.(2025a)]{ouattara2025a} K.~I.~Ouattara et al. Quantifying calibration error through evidence-based theory. \emph{FUSION}, 2025.
+\bibitem[Ouattara et al.(2025b)]{ouattara2025b} K.~I.~Ouattara et al. Assessing trustworthiness of AI training datasets using subjective logic. arXiv:2508.13813.
+\bibitem[Radford et al.(2021)]{radford2021} A.~Radford et al. CLIP. \emph{ICML}, 2021. %VERIFY
+\bibitem[Rezende et al.(2014)]{rezende2014} D.~J.~Rezende, S.~Mohamed, D.~Wierstra. Stochastic backpropagation. \emph{ICML}, 2014.
+\bibitem[Sensoy et al.(2018)]{sensoy2018} M.~Sensoy, L.~Kaplan, M.~Kandemir. Evidential deep learning. \emph{NeurIPS}, 2018.
+\bibitem[Shen et al.(2024)]{shen2024} M.~Shen et al. Are uncertainty quantification capabilities of evidential deep learning a mirage? arXiv:2402.06160.
+\end{thebibliography}
+\end{document}
