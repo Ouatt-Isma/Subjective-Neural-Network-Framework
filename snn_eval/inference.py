@@ -7,26 +7,28 @@ EPS = 1e-6
 
 @torch.no_grad()
 def snn_nested_samples(model, X, Np=10, Nm=10, device="cpu"):
-    """Return raw probs (B, Np*Nm, K) and per-beta means (B, Np, K)."""
+    """Return raw probs (B, Np*Nm, K) and per-beta means (B, Np, K).
+
+    Features are precomputed once (important for CNN/ResNet backbones).
+    """
     model.eval().to(device)
     X = X.to(device)
     B = X.shape[0]
+    feats = model.extract_features(X)              # (B, H) — computed once
     per_beta = []
     raw = []
     for _ in range(Np):
-        # one trust sample shared across the Nm masks
-        p = model.sample_p(B)  # (B, H)
+        p = model.sample_p(B)                      # one trust draw per outer step
         masks = []
         for _ in range(Nm):
             z = torch.bernoulli(p)
-            h = F.relu(model.fc1(model.ln(X))) * z
-            logits = model.fc2(h)
+            logits = model.fc2(feats * z)
             masks.append(F.softmax(logits, dim=1))
         masks = torch.stack(masks, dim=1)          # (B, Nm, K)
         raw.append(masks)
-        per_beta.append(masks.mean(dim=1))          # (B, K)
-    raw = torch.cat(raw, dim=1)                      # (B, Np*Nm, K)
-    per_beta = torch.stack(per_beta, dim=1)          # (B, Np, K)
+        per_beta.append(masks.mean(dim=1))         # (B, K)
+    raw = torch.cat(raw, dim=1)                    # (B, Np*Nm, K)
+    per_beta = torch.stack(per_beta, dim=1)        # (B, Np, K)
     return raw.cpu(), per_beta.cpu()
 
 

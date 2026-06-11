@@ -3,13 +3,17 @@
 Train SNN head on the 'easy' regime, evaluate on the easy/split/diffuse mixture,
 compare 1D rejection rules (H, neg_b, u) against the 2D (max_b, u) frontier.
 
+Results are cached in results/cache/ keyed by all non-device parameters.
+Re-run with --no-cache to bypass the cache.
+
 Usage: python -m snn_eval.run_exp2 --seeds 10
+       python -m snn_eval.run_exp2 --seeds 10 --no-cache
 """
 import argparse
 import numpy as np
 import torch
-from scipy import stats  # only for the t-CI / Wilcoxon; optional
-from . import models, inference, metrics, data
+from scipy import stats
+from . import models, inference, metrics, data, cache
 try:
     _trapz = np.trapezoid
 except AttributeError:
@@ -17,7 +21,6 @@ except AttributeError:
 
 
 def ausc_1d(score_reject, correct):
-    # confidence = -score_reject (reject high score)
     return metrics.selective_ausc(-score_reject.numpy(), correct)
 
 
@@ -39,7 +42,6 @@ def ausc_2d(max_b, u, correct, grid=60):
     if not pts:
         return 0.0
     pts = sorted(pts)
-    # Pareto upper envelope of retained-accuracy vs coverage, integrate [0.4,1]
     covs = np.array([p[0] for p in pts]); accs = np.array([p[1] for p in pts])
     grid_cov = np.linspace(0.4, 1.0, 100)
     env = [accs[covs >= c].max() if (covs >= c).any() else 0.0 for c in grid_cov]
@@ -50,7 +52,6 @@ def run_seed(seed, args):
     torch.manual_seed(seed)
     Xtr, ytr, _, _, _, protos = data.make_synthetic(
         n_per_class=400, K=args.K, d=args.d, seed=seed)
-    # train on EASY only -> force extrapolation on split/diffuse
     snn = models.SubjectiveHead(args.d, args.d_hidden, args.K,
                                 prior_a=1, prior_b=1, init_keep=0.5)
     snn = models.train_head(snn, Xtr, ytr, args.K, epochs=args.epochs, is_snn=True,
@@ -60,13 +61,42 @@ def run_seed(seed, args):
     sig = inference.sl_signals(raw, pb)
     correct = (sig["probs"].argmax(1) == ymix).numpy()
     max_b = sig["b"].max(1).values
-    res = {
-        "H": ausc_1d(sig["H"], correct),
-        "neg_b": ausc_1d(sig["neg_b"], correct),
-        "u": ausc_1d(sig["u"], correct),
-        "2D": ausc_2d(max_b, sig["u"], correct),
+    return {
+        "H":    ausc_1d(sig["H"],    correct),
+        "neg_b":ausc_1d(sig["neg_b"],correct),
+        "u":    ausc_1d(sig["u"],    correct),
+        "2D":   ausc_2d(max_b, sig["u"], correct),
     }
-    return res
+
+
+def compute(args):
+    keys = ["H", "neg_b", "u", "2D"]
+    vals = {k: [] for k in keys}
+    for s in range(args.seeds):
+        r = run_seed(s, args)
+        for k in keys:
+            vals[k].append(r[k])
+        print(f"seed {s}: " + " ".join(f"{k}={r[k]:.4f}" for k in keys))
+    return {"vals": vals}
+
+
+def display(res):
+    vals = res["vals"]
+    keys = ["H", "neg_b", "u", "2D"]
+    two = np.array(vals["2D"])
+    print("\n%-8s %8s %20s %10s" % ("Signal", "MeanAUSC", "95% CI", "p vs 2D"))
+    for k in keys:
+        a = np.array(vals[k])
+        m = a.mean()
+        ci = stats.t.interval(0.95, len(a) - 1, loc=m, scale=stats.sem(a)) if len(a) > 1 else (m, m)
+        if k == "2D":
+            p = float("nan")
+        else:
+            try:
+                p = stats.wilcoxon(two, a, alternative="greater").pvalue
+            except Exception:
+                p = float("nan")
+        print("%-8s %8.4f   [%.4f, %.4f] %10.3f" % (k, m, ci[0], ci[1], p))
 
 
 def main():
@@ -80,30 +110,16 @@ def main():
     ap.add_argument("--Nm", type=int, default=20)
     ap.add_argument("--K", type=int, default=4)
     ap.add_argument("--d", type=int, default=768)
+    ap.add_argument("--no-cache", action="store_true", dest="no_cache",
+                    help="Ignore cached results and re-run from scratch")
     args = ap.parse_args()
 
-    keys = ["H", "neg_b", "u", "2D"]
-    vals = {k: [] for k in keys}
-    for s in range(args.seeds):
-        r = run_seed(s, args)
-        for k in keys:
-            vals[k].append(r[k])
-        print(f"seed {s}: " + " ".join(f"{k}={r[k]:.4f}" for k in keys))
-
-    print("\n%-8s %8s %20s %10s" % ("Signal", "MeanAUSC", "95% CI", "p vs 2D"))
-    two = np.array(vals["2D"])
-    for k in keys:
-        a = np.array(vals[k])
-        m = a.mean()
-        ci = stats.t.interval(0.95, len(a) - 1, loc=m, scale=stats.sem(a)) if len(a) > 1 else (m, m)
-        if k == "2D":
-            p = float("nan")
-        else:
-            try:
-                p = stats.wilcoxon(two, a, alternative="greater").pvalue
-            except Exception:
-                p = float("nan")
-        print("%-8s %8.4f   [%.4f, %.4f] %10.3f" % (k, m, ci[0], ci[1], p))
+    params = {k: v for k, v in vars(args).items() if k not in ("device", "no_cache")}
+    res = None if args.no_cache else cache.load("run_exp2", params)
+    if res is None:
+        res = compute(args)
+        cache.save("run_exp2", params, res)
+    display(res)
 
 
 if __name__ == "__main__":

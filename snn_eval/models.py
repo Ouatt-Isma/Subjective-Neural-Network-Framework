@@ -8,6 +8,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tqdm
 
 EPS = 1e-6
 
@@ -131,10 +132,14 @@ class SubjectiveHead(nn.Module):
                  + torch.log(u) - torch.log(1 - u))
         return torch.sigmoid(logit / self.tau)
 
+    def extract_features(self, x):
+        """Hidden representation before trust masking, shape (N, d_hidden)."""
+        return F.relu(self.fc1(self.ln(x)))
+
     def forward(self, x, sample=True, hard=None):
         if hard is None:
             hard = not self.training
-        h = F.relu(self.fc1(self.ln(x)))
+        h = self.extract_features(x)
         if sample:
             p = self.sample_p(x.shape[0])
             z = self.sample_mask(p, hard=hard)
@@ -154,6 +159,124 @@ class SubjectiveHead(nn.Module):
 
 
 # ----------------------------------------------------------------------
+# Image backbones (CNN and tiny ResNet) for run_mnist --arch cnn/resnet
+# ----------------------------------------------------------------------
+class _ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels), nn.ReLU(),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, x):
+        return F.relu(self.net(x) + x)
+
+
+class _CNNBackbone(nn.Module):
+    """LeNet-style: three conv layers + pool -> (N, d_out). Input (N,1,28,28)."""
+
+    def __init__(self, d_out):
+        super().__init__()
+        self.convs = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.MaxPool2d(2),                      # 28x28 -> 14x14
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.MaxPool2d(2),                      # 14x14 -> 7x7
+        )
+        self.fc = nn.Linear(64 * 7 * 7, d_out)
+
+    def forward(self, x):
+        return F.relu(self.fc(self.convs(x).flatten(1)))
+
+
+class _TinyResNet(nn.Module):
+    """4-block residual net with global avg pool -> (N, d_out). Input (N,1,28,28)."""
+
+    def __init__(self, d_out):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.ReLU(),
+        )
+        self.stage1 = nn.Sequential(_ResBlock(32), _ResBlock(32))
+        self.down1 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(),        # 28x28 -> 14x14
+        )
+        self.stage2 = nn.Sequential(_ResBlock(64), _ResBlock(64))
+        self.down2 = nn.Sequential(
+            nn.Conv2d(64, 64, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(),        # 14x14 -> 7x7
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(64, d_out)
+
+    def forward(self, x):
+        x = self.down2(self.stage2(self.down1(self.stage1(self.stem(x)))))
+        return F.relu(self.fc(self.pool(x).flatten(1)))
+
+
+def _make_backbone(arch, d_out):
+    if arch == "cnn":    return _CNNBackbone(d_out)
+    if arch == "resnet": return _TinyResNet(d_out)
+    raise ValueError(f"unknown arch {arch!r}; expected 'cnn' or 'resnet'")
+
+
+class SubjectiveCNN(nn.Module):
+    """SNN with CNN or ResNet image backbone. Same external interface as SubjectiveHead."""
+
+    def __init__(self, arch, d_hidden, n_classes,
+                 prior_a=7.0, prior_b=3.0, init_keep=0.7, tau=0.5):
+        super().__init__()
+        self.backbone = _make_backbone(arch, d_hidden)
+        self.head = SubjectiveHead(d_hidden, d_hidden, n_classes,
+                                   prior_a=prior_a, prior_b=prior_b,
+                                   init_keep=init_keep, tau=tau)
+
+    @property
+    def fc2(self): return self.head.fc2
+
+    def sample_p(self, batch):   return self.head.sample_p(batch)
+    def alpha_beta(self):        return self.head.alpha_beta()
+    def expected_keep(self):     return self.head.expected_keep()
+    def kl(self):                return self.head.kl()
+
+    def extract_features(self, x):
+        return self.head.extract_features(self.backbone(x))
+
+    def forward(self, x, sample=True, hard=None):
+        return self.head(self.backbone(x), sample=sample, hard=hard)
+
+
+class MCDropoutCNN(nn.Module):
+    """MC Dropout with CNN or ResNet image backbone."""
+
+    def __init__(self, arch, d_hidden, n_classes, p_drop=0.5):
+        super().__init__()
+        self.backbone = _make_backbone(arch, d_hidden)
+        self.head = MCDropoutHead(d_hidden, d_hidden, n_classes, p_drop=p_drop)
+
+    def forward(self, x, sample=False):
+        return self.head(self.backbone(x), sample=sample)
+
+
+class EDLCNN(nn.Module):
+    """EDL with CNN or ResNet image backbone."""
+
+    def __init__(self, arch, d_hidden, n_classes):
+        super().__init__()
+        self.backbone = _make_backbone(arch, d_hidden)
+        self.head = EDLHead(d_hidden, d_hidden, n_classes)
+        self.n_classes = n_classes
+
+    def forward(self, x):
+        return self.head(self.backbone(x))
+
+
+# ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
 def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
@@ -170,7 +293,7 @@ def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
         perm = torch.randperm(n)
         ep_loss, ep_correct, ep_seen, ep_kl = 0.0, 0, 0, 0.0
         beta = lam_t = 0.0
-        for i in range(0, n - bs + 1, bs):
+        for i in tqdm(range(0, n - bs + 1, bs), desc=f"Epoch {ep+1}/{epochs}", disable=not verbose):
             idx = perm[i:i + bs]
             xb, yb = Xtr[idx].to(device), ytr[idx].to(device)
             opt.zero_grad()
