@@ -1,12 +1,16 @@
 """Inference: nested sampling, Dirichlet moment matching, SL signals, LoTV split."""
 import torch
 import torch.nn.functional as F
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kw): return it
 
 EPS = 1e-6
 
 
 @torch.no_grad()
-def snn_nested_samples(model, X, Np=10, Nm=10, device="cpu"):
+def snn_nested_samples(model, X, Np=10, Nm=10, device="cpu", desc=None):
     """Return raw probs (B, Np*Nm, K) and per-beta means (B, Np, K).
 
     Features are precomputed once (important for CNN/ResNet backbones).
@@ -17,7 +21,7 @@ def snn_nested_samples(model, X, Np=10, Nm=10, device="cpu"):
     feats = model.extract_features(X)              # (B, H) — computed once
     per_beta = []
     raw = []
-    for _ in range(Np):
+    for _ in tqdm(range(Np), desc=desc, leave=False, disable=desc is None):
         p = model.sample_p(B)                      # one trust draw per outer step
         masks = []
         for _ in range(Nm):
@@ -68,10 +72,11 @@ def sl_signals(raw, per_beta):
 
 
 @torch.no_grad()
-def mc_dropout_probs(model, X, T=100, device="cpu"):
+def mc_dropout_probs(model, X, T=100, device="cpu", desc=None):
     model.eval().to(device)
     X = X.to(device)
-    outs = [F.softmax(model(X, sample=True), dim=1) for _ in range(T)]
+    outs = [F.softmax(model(X, sample=True), dim=1)
+            for _ in tqdm(range(T), desc=desc, leave=False, disable=desc is None)]
     outs = torch.stack(outs, dim=1)                     # (B, T, K)
     return outs.mean(dim=1).cpu(), outs.cpu()
 
