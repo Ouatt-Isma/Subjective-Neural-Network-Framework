@@ -3,8 +3,11 @@
 Train SNN head on the 'easy' regime, evaluate on the easy/split/diffuse mixture,
 compare 1D rejection rules (H, neg_b, u) against the 2D (max_b, u) frontier.
 
-Results are cached in results/cache/ keyed by all non-device parameters.
-Re-run with --no-cache to bypass the cache.
+Persistence:
+  results/cache/run_exp2_<hash>_results.json  (keyed by all params; no model saving
+  since each seed trains a fresh model — the per-seed AUSCs are the output)
+
+Use --no-cache to re-run all seeds from scratch.
 
 Usage: python -m snn_eval.run_exp2 --seeds 10
        python -m snn_eval.run_exp2 --seeds 10 --no-cache
@@ -56,16 +59,16 @@ def run_seed(seed, args):
                                 prior_a=1, prior_b=1, init_keep=0.5)
     snn = models.train_head(snn, Xtr, ytr, args.K, epochs=args.epochs, is_snn=True,
                             beta_max=args.beta_max, warmup_frac=0.2, device=args.device)
-    Xmix, ymix, regime = data.make_regime_mixture(protos, K=args.K, seed=seed)
+    Xmix, ymix, _ = data.make_regime_mixture(protos, K=args.K, seed=seed)
     raw, pb = inference.snn_nested_samples(snn, Xmix, args.Np, args.Nm, args.device)
     sig = inference.sl_signals(raw, pb)
     correct = (sig["probs"].argmax(1) == ymix).numpy()
     max_b = sig["b"].max(1).values
     return {
-        "H":    ausc_1d(sig["H"],    correct),
-        "neg_b":ausc_1d(sig["neg_b"],correct),
-        "u":    ausc_1d(sig["u"],    correct),
-        "2D":   ausc_2d(max_b, sig["u"], correct),
+        "H":     ausc_1d(sig["H"],     correct),
+        "neg_b": ausc_1d(sig["neg_b"], correct),
+        "u":     ausc_1d(sig["u"],     correct),
+        "2D":    ausc_2d(max_b, sig["u"], correct),
     }
 
 
@@ -111,14 +114,14 @@ def main():
     ap.add_argument("--K", type=int, default=4)
     ap.add_argument("--d", type=int, default=768)
     ap.add_argument("--no-cache", action="store_true", dest="no_cache",
-                    help="Ignore cached results and re-run from scratch")
+                    help="Re-run all seeds from scratch")
     args = ap.parse_args()
 
-    params = {k: v for k, v in vars(args).items() if k not in ("device", "no_cache")}
-    res = None if args.no_cache else cache.load("run_exp2", params)
+    all_params = {k: v for k, v in vars(args).items() if k not in ("device", "no_cache")}
+    res = None if args.no_cache else cache.load_results("run_exp2", all_params)
     if res is None:
         res = compute(args)
-        cache.save("run_exp2", params, res)
+        cache.save_results("run_exp2", all_params, res)
     display(res)
 
 

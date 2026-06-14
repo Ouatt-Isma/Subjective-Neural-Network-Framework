@@ -8,7 +8,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tqdm
+from tqdm import tqdm
 
 EPS = 1e-6
 
@@ -279,9 +279,33 @@ class EDLCNN(nn.Module):
 # ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
+@torch.no_grad()
+def recalibrate_bn(model, X, device="cpu", bs=512):
+    """Recompute BatchNorm running stats with one cumulative pass over X.
+
+    EDL's evidence-maximising loss drives backbone activations to magnitudes
+    where small-batch BN statistics drift from the running averages, costing
+    ~2pts test accuracy at eval time (MNIST/resnet); a full-data pass with
+    cumulative averaging removes the train/eval mismatch.
+    """
+    bns = [m for m in model.modules()
+           if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))]
+    if not bns:
+        return
+    momenta = [m.momentum for m in bns]
+    for m in bns:
+        m.reset_running_stats()
+        m.momentum = None  # cumulative moving average
+    model.train()
+    for i in range(0, X.shape[0], bs):
+        model(X[i:i + bs].to(device))
+    for m, mom in zip(bns, momenta):
+        m.momentum = mom
+
+
 def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
                beta_max=5.0, warmup_frac=0.1, is_snn=False, is_edl=False,
-               edl_lam=1.0, device="cpu", verbose=False):
+               edl_lam=1.0, device="cpu", verbose=False, Xte=None, yte=None):
     model.to(device).train()
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     n = Xtr.shape[0]
@@ -319,12 +343,24 @@ def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
             ep_seen += len(yb)
         if verbose:
             msg = (f"  ep {ep+1:>3}/{epochs} loss={ep_loss/max(1,ep_seen):.4f} "
-                   f"acc={ep_correct/max(1,ep_seen):.4f}")
+                   f"tr_acc={ep_correct/max(1,ep_seen):.4f}")
+            if Xte is not None and yte is not None:
+                model.eval()
+                with torch.no_grad():
+                    if is_edl:
+                        te_preds = model(Xte.to(device)).argmax(1)
+                    else:
+                        te_preds = model(Xte.to(device), sample=is_snn).argmax(1)
+                te_acc = (te_preds == yte.to(device)).float().mean().item()
+                msg += f" te_acc={te_acc:.4f}"
+                model.train()
             if is_snn:
                 msg += (f" kl={ep_kl/max(1,steps):.1f} beta={beta:.2f} "
                         f"std(E[p])={model.expected_keep().std().item():.4f}")
             if is_edl:
                 msg += f" lam={lam_t:.2f}"
             print(msg, flush=True)
+    if is_edl:
+        recalibrate_bn(model, Xtr, device=device)
     model.eval()
     return model
