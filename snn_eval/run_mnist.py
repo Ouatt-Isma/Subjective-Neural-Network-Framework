@@ -113,12 +113,20 @@ def _prep_inputs(X_img, arch):
 
 
 # ---------------- compute / display ----------------
-def compute(args):
-    """Train (or reload) models, run inference, return JSON-serialisable results dict."""
+def compute(args, loader=None, exp_name="run_mnist"):
+    """Train (or reload) models, run inference, return JSON-serialisable results dict.
+
+    `loader` defaults to load_synthetic/load_mnist (picked via args.synthetic) but
+    accepts any zero-arg callable returning ((Xtr,ytr),(Xte,yte),Xood) with the same
+    shapes (images (N,1,28,28), int labels) — pass a different one to point this same
+    pipeline at another MNIST-shaped dataset (e.g. FashionMNIST/KMNIST) without
+    touching training/inference/metrics code. `exp_name` namespaces the model cache
+    so alternate-dataset runs don't collide with the default MNIST cache entries.
+    """
     torch.manual_seed(args.seed)
-    loader = load_synthetic if args.synthetic else load_mnist
+    loader = loader or (load_synthetic if args.synthetic else load_mnist)
     (Xtr_i, ytr), (Xte_i, yte), Xood_i = loader()
-    K = 10
+    K = int(torch.cat([ytr, yte]).max().item()) + 1
 
     Xtr  = _prep_inputs(Xtr_i,  args.arch)
     Xte  = _prep_inputs(Xte_i,  args.arch)
@@ -130,7 +138,7 @@ def compute(args):
     snn, mcd, edl = _build_models(args, K)
     heads = {"snn": snn, "mcd": mcd, "edl": edl}
 
-    loaded = set() if args.no_cache else cache.load_models("run_mnist", train_params, **heads)
+    loaded = set() if args.no_cache else cache.load_models(exp_name, train_params, **heads)
     missing = [n for n in heads if n not in loaded]
     if not missing:
         print("[training skipped — models loaded from cache]")
@@ -147,7 +155,7 @@ def compute(args):
         if "edl" in missing:
             print("[training EDL]")
             models.train_head(edl, Xtr, ytr, K, is_edl=True, **common)
-        cache.save_models("run_mnist", train_params,
+        cache.save_models(exp_name, train_params,
                           **{n: heads[n] for n in missing})
 
     # --- inference ---
@@ -223,8 +231,15 @@ def compute(args):
     return {"arch": args.arch, "n_rot": n, "table": table, "sweep": sweep}
 
 
-def display(res):
-    """Print tables, save CSV and plot from a pre-computed results dict."""
+def display(res, out_prefix="rotation_sweep"):
+    """Print tables, save CSV and plot from a pre-computed results dict.
+
+    `out_prefix` names the CSV/PNG under results/ (default "rotation_sweep",
+    matching the CLI) — pass a dataset-specific prefix when calling this for
+    more than one dataset so outputs don't overwrite each other. Returns the
+    matplotlib Figure (or None if matplotlib is unavailable) so callers such
+    as a notebook can display it inline in addition to the saved PNG.
+    """
     print(f"\narch={res['arch']}")
     print("\n%-18s %6s %6s %6s %9s" % ("Model", "Acc", "NLL", "ECE", "OOD-AUROC"))
     for row in res["table"]:
@@ -242,15 +257,22 @@ def display(res):
 
     import csv, os
     os.makedirs("results", exist_ok=True)
-    with open("results/rotation_sweep.csv", "w", newline="") as f:
+    csv_path = f"results/{out_prefix}.csv"
+    with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["deg", "acc", "snn_u_star", "snn_u_e", "snn_u_a", "snn_H",
                     "mcd_H", "mcd_epi", "mcd_alea", "edl_u", "edl_H"])
         w.writerows(sweep)
-    print("saved results/rotation_sweep.csv")
+    print(f"saved {csv_path}")
     try:
         import matplotlib
-        matplotlib.use("Agg")
+        try:
+            from IPython import get_ipython
+            in_notebook = get_ipython() is not None
+        except ImportError:
+            in_notebook = False
+        if not in_notebook:
+            matplotlib.use("Agg")  # headless CLI runs have no display backend
         import matplotlib.pyplot as plt
         import numpy as np
         A = np.array(sweep)
@@ -265,13 +287,21 @@ def display(res):
         ax[2].plot(A[:, 0], A[:, 10], "-^", ms=3, label="EDL H")
         ax[2].set_title("Entropy comparison"); ax[2].legend(fontsize=8)
         for a in ax: a.set_xlabel("rotation (deg)")
-        fig.tight_layout(); fig.savefig("results/rotation_sweep.png", dpi=140)
-        print("saved results/rotation_sweep.png")
+        fig.tight_layout()
+        png_path = f"results/{out_prefix}.png"
+        fig.savefig(png_path, dpi=140)
+        print(f"saved {png_path}")
+        return fig
     except ImportError:
         print("(matplotlib not installed; skipped plot)")
+        return None
 
 
-def main():
+def build_argparser():
+    """Build the CLI parser. Also used by callers (e.g. notebooks) that want
+    a Namespace of defaults without duplicating the argument list — e.g.
+    `args = build_argparser().parse_args([]); args.epochs = 3`.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="mlp", choices=["mlp", "cnn", "resnet"],
                     help="Model architecture: mlp (flat 784), cnn (LeNet), resnet (tiny ResNet)")
@@ -288,7 +318,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-cache", action="store_true", dest="no_cache",
                     help="Retrain and re-run inference from scratch")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_argparser().parse_args()
 
     all_params   = {k: v for k, v in vars(args).items() if k not in ("device", "no_cache")}
     res = None if args.no_cache else cache.load_results("run_mnist", all_params)

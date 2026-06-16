@@ -7,20 +7,21 @@ Minimal 2-unit network with deterministic priority inference:
 Theoretical class probs given p:  P(0)=(1-p)p,  P(1)=p,  P(2)=(1-p)^2.
 
 For each regime we run nested sampling (Np outer trust draws, Nm inner mask
-draws), compute the LoTV split (varE = epistemic, eVar = aleatoric) and the
-augmented opinion, and check the mechanism claims:
+draws), compute the BALD split (MI = epistemic mutual information, eH =
+expected per-draw entropy = aleatoric) and the augmented opinion, and check
+the mechanism claims:
 
-  trusted   (a>>b): p~1, always class 1            -> both vars ~ 0, u* low
-  distrusted(a<<b): p~0, always class 2            -> both vars ~ 0
+  trusted   (a>>b): p~1, always class 1            -> H_total, eH ~ 0, u* low
+  distrusted(a<<b): p~0, always class 2            -> H_total, eH ~ 0, u* low
   aleatoric (a=b>>1): p~0.5 every draw; classes vary WITHIN a draw
-                      -> eVar >> varE  -> u (epistemic share) LOW
+                      -> eH ~ H_total  -> MI small -> u (epistemic share) LOW
   epistemic (a=b<<1): p~0 or 1 PER draw; pure within, differs across
-                      -> varE >> eVar  -> u HIGH
+                      -> eH ~ 0, H_total large -> MI ~ H_total -> u HIGH
   flat      (a=b=1):  p uniform per draw           -> mixed, u mid/high
 
 Pooled counts can be IDENTICAL for the aleatoric and epistemic regimes
 ([0,1,2],[0,1,2],[0,1,2] vs [0,0,0],[1,1,1],[2,2,2]) — a pooled Dirichlet
-cannot tell them apart; only the LoTV split inside the augmented opinion can.
+cannot tell them apart; only the BALD split inside the augmented opinion can.
 
 Usage: python -m snn_eval.sim_units [--Np 200 --Nm 50 --prior 1.0]
 """
@@ -58,13 +59,20 @@ def simulate(alpha, beta, Np, Nm, seed=0):
 
 
 def theory(alpha, beta, n=200000, seed=0):
-    """Analytic LoTV in the Nm->inf inner limit (multinomial noise removed)."""
+    """Analytic BALD split in the Nm->inf inner limit (multinomial noise removed).
+
+    Each outer trust draw p yields a deterministic per-draw class distribution
+    gk = (P(0),P(1),P(2)); eH = E_i[H(gk_i)] (aleatoric), H_total = H(E_i[gk_i])
+    (total), MI = H_total - eH (epistemic).
+    """
     g = torch.Generator().manual_seed(seed)
     p = torch.distributions.Beta(torch.tensor(alpha), torch.tensor(beta)).sample((n,))
     gk = torch.stack([(1 - p) * p, p, (1 - p) ** 2], dim=1)   # (n,3)
-    varE = gk.var(0, unbiased=False).sum().item()             # epistemic
-    eVar = (gk * (1 - gk)).mean(0).sum().item()                # per-draw multinomial
-    return varE, eVar
+    grand = gk.mean(0)
+    H_total = -(grand.clamp_min(1e-12) * grand.clamp_min(1e-12).log()).sum().item()
+    eH = (-(gk.clamp_min(1e-12) * gk.clamp_min(1e-12).log()).sum(-1)).mean().item()
+    MI = max(0.0, H_total - eH)
+    return MI, eH
 
 
 def main():
@@ -75,18 +83,17 @@ def main():
     args = ap.parse_args()
 
     print("Per-class theory: P(0)=(1-p)p  P(1)=p  P(2)=(1-p)^2")
-    print("%-15s %8s %8s %8s %8s | %8s %8s | %s" %
-          ("regime", "u_LoTV", "u_playgr", "sum varE", "sum eVar", "thy varE", "thy eVar", "P (projected)"))
+    print("%-15s %8s %8s %8s | %8s %8s | %s" %
+          ("regime", "u_BALD", "MI", "eH", "thy MI", "thy eH", "P (projected)"))
     for name, (a, b) in REGIMES.items():
         raw = simulate(a, b, args.Np, args.Nm)
-        op = augmented_opinion(raw, prior=args.prior, mode="counts", aleatoric="categorical")
-        op_pg = augmented_opinion(raw, prior=args.prior, mode="counts", aleatoric="posterior")
-        tE, tA = theory(a, b)
+        op = augmented_opinion(raw, prior=args.prior, mode="counts")
+        tMI, teH = theory(a, b)
         P = " ".join(f"{x:.2f}" for x in op["P"][0].tolist())
-        print("%-15s %8.3f %8.3f %8.4f %8.4f | %8.4f %8.4f | %s" %
-              (name, op["u"].item(), op_pg["u"].item(), op["u_e"].item(), op["u_a"].item(), tE, tA, P))
+        print("%-15s %8.3f %8.4f %8.4f | %8.4f %8.4f | %s" %
+              (name, op["u"].item(), op["MI"].item(), op["eH"].item(), tMI, teH, P))
     print("\nExpected ordering: u(aleatoric) << u(epistemic_u);")
-    print("trusted/distrusted: tiny variances, direction concentrated on class 1 / 2.")
+    print("trusted/distrusted: tiny entropy everywhere, direction concentrated on class 1 / 2.")
 
 
 if __name__ == "__main__":
