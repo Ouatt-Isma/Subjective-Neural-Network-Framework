@@ -1,6 +1,16 @@
-torch>=2.0
+# ── CUDA wheels (CUDA 12.1) ────────────────────────────────────────────────
+# Install with:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+# For CUDA 12.4 replace cu121 with cu124; for CPU-only drop the flag entirely.
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# ── Core ───────────────────────────────────────────────────────────────────
+torch>=2.3.0
+torchvision>=0.18.0
 numpy>=1.23
 scipy>=1.9
-# for real frozen-backbone features (not needed for --backbone synthetic):
-torchvision>=0.15
-timm>=0.9          # only if using a timm backbone instead of dinov2
+tqdm>=4.65
+
+# ── Optional: frozen-backbone experiments ─────────────────────────────────
+# timm>=0.9          # timm backbone (run_exp1 --backbone <timm-model>)
+# matplotlib>=3.7    # rotation-sweep plots (run_mnist --plot)
