@@ -33,7 +33,7 @@ from . import models, inference, metrics, cache
 from . import augmented as aug
 
 # params that affect model structure / training (used for model cache key)
-_TRAIN_KEYS = ("arch", "epochs", "d_hidden", "beta_max", "seed", "synthetic")
+_TRAIN_KEYS = ("arch", "epochs", "d_hidden", "beta_max", "seed", "synthetic", "n_train", "label_noise")
 
 
 # ---------------- data helpers ----------------
@@ -60,6 +60,33 @@ def load_synthetic(ntr=3000, nte=600):
         return X, y
     (Xtr, ytr), (Xte, yte) = mk(ntr, 1), mk(nte, 2)
     return (Xtr, ytr), (Xte, yte), torch.rand(nte, 1, 28, 28) * 2
+
+
+def load_mnist_class_split(id_classes=(0, 1, 2, 3, 4), root="./data", nte=1000):
+    """Epistemic OOD probe: train only on id_classes; OOD = unseen-class test images.
+
+    Uses MNIST .data / .targets tensors directly for fast filtering without a
+    per-item loop. Returns the same contract as load_mnist so compute() accepts it
+    as a loader. K is inferred from yte (= len(id_classes)), not hardcoded.
+    Expected: model shows high u_e (MI) on OOD images because it has no training
+    signal for those feature regions — trust parameters remain diffuse.
+    """
+    import torchvision as tv
+    tr = tv.datasets.MNIST(root, train=True,  download=True)
+    te = tv.datasets.MNIST(root, train=False, download=True)
+    id_t = torch.tensor(list(id_classes))
+
+    def masked(ds, mask, n):
+        idx = mask.nonzero(as_tuple=True)[0][:n]
+        X = ds.data[idx].unsqueeze(1).float() / 255.0   # (N,1,28,28) in [0,1]
+        return X, ds.targets[idx]
+
+    id_tr  = torch.isin(tr.targets, id_t)
+    id_te  = torch.isin(te.targets, id_t)
+    Xtr, ytr  = masked(tr, id_tr,  60000)
+    Xte, yte  = masked(te, id_te,  nte)
+    Xood, _   = masked(te, ~id_te, nte)
+    return (Xtr, ytr), (Xte, yte), Xood
 
 
 NORM = (0.1307, 0.3081)
@@ -112,28 +139,14 @@ def _prep_inputs(X_img, arch):
     return flat(X_img) if arch == "mlp" else normalize(X_img)
 
 
-# ---------------- compute / display ----------------
-def compute(args, loader=None, exp_name="run_mnist"):
-    """Train (or reload) models, run inference, return JSON-serialisable results dict.
-
-    `loader` defaults to load_synthetic/load_mnist (picked via args.synthetic) but
-    accepts any zero-arg callable returning ((Xtr,ytr),(Xte,yte),Xood) with the same
-    shapes (images (N,1,28,28), int labels) — pass a different one to point this same
-    pipeline at another MNIST-shaped dataset (e.g. FashionMNIST/KMNIST) without
-    touching training/inference/metrics code. `exp_name` namespaces the model cache
-    so alternate-dataset runs don't collide with the default MNIST cache entries.
+# ---------------- model train-or-load ----------------
+def build_or_train_models(args, K, Xtr=None, ytr=None, Xte=None, yte=None, exp_name="run_mnist"):
+    """Build SNN/MCD/EDL heads for args.arch; load cached weights where available,
+    train the rest on (Xtr, ytr). Returns dict(snn=..., mcd=..., edl=...) of the
+    actual trained nn.Module instances — pass Xtr/ytr only if a cache miss is
+    possible (e.g. omit them to fetch already-cached models for scoring custom
+    probe batches, as compute() doesn't otherwise expose the trained models).
     """
-    torch.manual_seed(args.seed)
-    loader = loader or (load_synthetic if args.synthetic else load_mnist)
-    (Xtr_i, ytr), (Xte_i, yte), Xood_i = loader()
-    K = int(torch.cat([ytr, yte]).max().item()) + 1
-
-    Xtr  = _prep_inputs(Xtr_i,  args.arch)
-    Xte  = _prep_inputs(Xte_i,  args.arch)
-    Xood = _prep_inputs(Xood_i, args.arch)
-    print(f"arch={args.arch}  train={len(ytr)}  test={len(yte)}  hidden={args.d_hidden}")
-
-    # --- training (with per-model cache: only missing models are trained) ---
     train_params = {k: getattr(args, k) for k in _TRAIN_KEYS}
     snn, mcd, edl = _build_models(args, K)
     heads = {"snn": snn, "mcd": mcd, "edl": edl}
@@ -157,6 +170,45 @@ def compute(args, loader=None, exp_name="run_mnist"):
             models.train_head(edl, Xtr, ytr, K, is_edl=True, **common)
         cache.save_models(exp_name, train_params,
                           **{n: heads[n] for n in missing})
+    return heads
+
+
+# ---------------- compute / display ----------------
+def compute(args, loader=None, exp_name="run_mnist", return_models=False):
+    """Train (or reload) models, run inference, return JSON-serialisable results dict.
+
+    `loader` defaults to load_synthetic/load_mnist (picked via args.synthetic) but
+    accepts any zero-arg callable returning ((Xtr,ytr),(Xte,yte),Xood) with the same
+    shapes (images (N,1,28,28), int labels) — pass a different one to point this same
+    pipeline at another MNIST-shaped dataset (e.g. FashionMNIST/KMNIST) without
+    touching training/inference/metrics code. `exp_name` namespaces the model cache
+    so alternate-dataset runs don't collide with the default MNIST cache entries.
+    """
+    torch.manual_seed(args.seed)
+    loader = loader or (load_synthetic if args.synthetic else load_mnist)
+    (Xtr_i, ytr), (Xte_i, yte), Xood_i = loader()
+    K = int(torch.cat([ytr, yte]).max().item()) + 1
+
+    n_train = getattr(args, "n_train", 60000)
+    if n_train < len(ytr):
+        g = torch.Generator().manual_seed(args.seed)
+        idx = torch.randperm(len(ytr), generator=g)[:n_train]
+        Xtr_i, ytr = Xtr_i[idx], ytr[idx]
+    label_noise = getattr(args, "label_noise", 0.0)
+    if label_noise > 0.0:
+        g = torch.Generator().manual_seed(args.seed + 1)
+        flip = torch.rand(len(ytr), generator=g) < label_noise
+        ytr = ytr.clone()
+        ytr[flip] = torch.randint(0, K, (int(flip.sum().item()),), generator=g)
+
+    Xtr  = _prep_inputs(Xtr_i,  args.arch)
+    Xte  = _prep_inputs(Xte_i,  args.arch)
+    Xood = _prep_inputs(Xood_i, args.arch)
+    print(f"arch={args.arch}  train={len(ytr)}  test={len(yte)}  hidden={args.d_hidden}")
+
+    # --- training (with per-model cache: only missing models are trained) ---
+    heads = build_or_train_models(args, K, Xtr, ytr, Xte, yte, exp_name=exp_name)
+    snn, mcd, edl = heads["snn"], heads["mcd"], heads["edl"]
 
     # --- inference ---
     n_te, n_ood = len(yte), Xood.shape[0]
@@ -174,11 +226,13 @@ def compute(args, loader=None, exp_name="run_mnist"):
     sig_id  = inference.sl_signals(raw_id, pb_id)
     sig_ood = inference.sl_signals(raw_o,  pb_o)
     print(f"  MC Dropout (T={args.T}, ID)...")
-    pm,   _ = inference.mc_dropout_probs(mcd, Xte,  T=args.T, device=args.device,
+    pm,   sm_id  = inference.mc_dropout_probs(mcd, Xte,  T=args.T, device=args.device,
                                          desc=f"MCD ID  T={args.T}")
     print(f"  MC Dropout (T={args.T}, OOD)...")
-    pm_o, _ = inference.mc_dropout_probs(mcd, Xood, T=args.T, device=args.device,
+    pm_o, sm_ood = inference.mc_dropout_probs(mcd, Xood, T=args.T, device=args.device,
                                          desc=f"MCD OOD T={args.T}")
+    mcd_id  = aug.bald_opinion(sm_id)
+    mcd_ood = aug.bald_opinion(sm_ood)
     print("  EDL opinion (ID + OOD)...")
     pe,   ue   = inference.edl_opinion(edl, Xte,  args.device)
     pe_o, ue_o = inference.edl_opinion(edl, Xood, args.device)
@@ -187,6 +241,8 @@ def compute(args, loader=None, exp_name="run_mnist"):
     # pre-compute table metrics as plain floats (JSON-serialisable)
     raw_rows = [
         ("MC Dropout",       pm,              1 - pm.max(1).values,  1 - pm_o.max(1).values),
+        ("MCD (mean, H)",    pm,              mcd_id["H"],            mcd_ood["H"]),
+        ("MCD (u* BALD)",    pm,              mcd_id["u"],            mcd_ood["u"]),
         ("EDL",              pe,              ue,                    ue_o),
         ("SNN (mean, H)",    sig_id["probs"], sig_id["H"],           sig_ood["H"]),
         ("SNN (u* counts)",  sig_id["probs"], op_id["u"],            op_o["u"]),
@@ -218,17 +274,58 @@ def compute(args, loader=None, exp_name="run_mnist"):
                                                 device=args.device,
                                                 desc=f"MCD {ang:3d}°")
         lm = lotv_from_samples(sm_a)
+        mcd_a = aug.bald_opinion(sm_a)
         pe_a, ue_a = inference.edl_opinion(edl, Xa, args.device)
         He = -(pe_a.clamp_min(1e-12) * pe_a.clamp_min(1e-12).log()).sum(-1)
         r = [ang, acc_a,
              op["u"].mean().item(), op["u_e"].mean().item(),
              op["u_a"].mean().item(), op["H"].mean().item(),
              lm["H"].mean().item(), lm["epi"].mean().item(), lm["alea"].mean().item(),
+             mcd_a["u"].mean().item(), mcd_a["u_e"].mean().item(), mcd_a["u_a"].mean().item(),
              ue_a.mean().item(), He.mean().item()]
         sweep.append(r)
-        print(f"  {ang:3d}°  acc={acc_a:.3f}  u*={r[2]:.3f}  u_e={r[3]:.4f}  H={r[5]:.3f}")
+        print(f"  {ang:3d}°  acc={acc_a:.3f}  SNN u*={r[2]:.3f} u_e={r[3]:.4f}  "
+              f"MCD u*={r[9]:.3f} u_e={r[10]:.4f}  H={r[5]:.3f}")
 
-    return {"arch": args.arch, "n_rot": n, "table": table, "sweep": sweep}
+    res = {"arch": args.arch, "n_rot": n, "table": table, "sweep": sweep}
+    if return_models:
+        return res, heads
+    return res
+
+
+def pixel_noise_probe(heads, Xte_i, yte, args, K, sigmas=(0.0, 0.1, 0.2, 0.4, 0.8)):
+    """Inference-time Gaussian pixel noise sweep on fixed trained models (aleatoric probe).
+
+    No retraining: adds N(0,sigma^2) noise to raw [0,1] test images, re-runs inference.
+    Expected signature: u_a (eH) rises with sigma; u_e (MI) stays relatively low because
+    all trust draws agree that the noisy image is ambiguous (no cross-draw disagreement).
+    Returns a list of dicts, one per sigma.
+    """
+    snn, mcd, edl = heads["snn"], heads["mcd"], heads["edl"]
+    rows = []
+    for sigma in sigmas:
+        g = torch.Generator().manual_seed(42)
+        Xn_i = (Xte_i + sigma * torch.randn(*Xte_i.shape, generator=g)).clamp(0.0, 1.0)
+        Xn = _prep_inputs(Xn_i, args.arch)
+        raw_n, pb_n = inference.snn_nested_samples(snn, Xn, args.Np, args.Nm, args.device)
+        op = aug.augmented_opinion(aug.raw_to_4d(raw_n, args.Np, args.Nm), prior=1.0 / K)
+        pm_n, sm_n = inference.mc_dropout_probs(mcd, Xn, T=args.T, device=args.device,
+                                                 desc=f"pixel_noise σ={sigma:.2f}")
+        mcd_n = aug.bald_opinion(sm_n)
+        pe_n, ue_n = inference.edl_opinion(edl, Xn, args.device)
+        rows.append({
+            "sigma":   float(sigma),
+            "acc":     metrics.accuracy(op["P"], yte),
+            "snn_u":   op["u"].mean().item(),
+            "snn_u_e": op["u_e"].mean().item(),
+            "snn_u_a": op["u_a"].mean().item(),
+            "snn_H":   op["H"].mean().item(),
+            "mcd_u":   mcd_n["u"].mean().item(),
+            "mcd_u_e": mcd_n["u_e"].mean().item(),
+            "mcd_u_a": mcd_n["u_a"].mean().item(),
+            "edl_u":   ue_n.mean().item(),
+        })
+    return rows
 
 
 def display(res, out_prefix="rotation_sweep"):
@@ -248,12 +345,12 @@ def display(res, out_prefix="rotation_sweep"):
 
     sweep = res["sweep"]
     print("\nRotation sweep (means over %d digits)" % res["n_rot"])
-    print("%5s | %5s  %-7s %-7s %-7s %-6s | %-6s %-7s %-7s | %-6s %-6s" % (
+    print("%5s | %5s  %-7s %-7s %-7s %-6s | %-6s %-7s %-7s | %-6s %-7s %-7s | %-6s %-6s" % (
         "deg", "acc", "SNN u*", "SNN u_e", "SNN u_a", "SNN H",
-        "MCD H", "MCD epi", "MCD ale", "EDL u", "EDL H"))
+        "MCD H", "MCD epi", "MCD ale", "MCD u*", "MCD u_e", "MCD u_a", "EDL u", "EDL H"))
     for r in sweep:
-        print("%5d | %5.3f  %-7.3f %-7.4f %-7.3f %-6.3f | %-6.3f %-7.4f %-7.3f | %-6.3f %-6.3f"
-              % tuple(r))
+        print("%5d | %5.3f  %-7.3f %-7.4f %-7.3f %-6.3f | %-6.3f %-7.4f %-7.3f | "
+              "%-6.3f %-7.4f %-7.3f | %-6.3f %-6.3f" % tuple(r))
 
     import csv, os
     os.makedirs("results", exist_ok=True)
@@ -261,7 +358,8 @@ def display(res, out_prefix="rotation_sweep"):
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["deg", "acc", "snn_u_star", "snn_u_e", "snn_u_a", "snn_H",
-                    "mcd_H", "mcd_epi", "mcd_alea", "edl_u", "edl_H"])
+                    "mcd_H", "mcd_epi", "mcd_alea", "mcd_u_star", "mcd_u_e", "mcd_u_a",
+                    "edl_u", "edl_H"])
         w.writerows(sweep)
     print(f"saved {csv_path}")
     try:
@@ -278,13 +376,14 @@ def display(res, out_prefix="rotation_sweep"):
         A = np.array(sweep)
         fig, ax = plt.subplots(1, 3, figsize=(13, 3.6))
         ax[0].plot(A[:, 0], A[:, 1], "k-o", ms=3); ax[0].set_title("Accuracy vs rotation")
-        ax[1].plot(A[:, 0], A[:, 2], "-o", ms=3, label="u* (epi share)")
-        ax[1].plot(A[:, 0], A[:, 3] / max(A[:, 3].max(), 1e-9), "-s", ms=3, label="u_e (norm)")
-        ax[1].plot(A[:, 0], A[:, 4] / max(A[:, 4].max(), 1e-9), "-^", ms=3, label="u_a (norm)")
-        ax[1].set_title("SNN decomposition"); ax[1].legend(fontsize=8)
+        ax[1].plot(A[:, 0], A[:, 2], "-o", ms=3, label="SNN u* (epi share)")
+        ax[1].plot(A[:, 0], A[:, 3] / max(A[:, 3].max(), 1e-9), "-s", ms=3, label="SNN u_e (norm)")
+        ax[1].plot(A[:, 0], A[:, 4] / max(A[:, 4].max(), 1e-9), "-^", ms=3, label="SNN u_a (norm)")
+        ax[1].plot(A[:, 0], A[:, 9], "-D", ms=3, label="MCD u* (BALD)")
+        ax[1].set_title("Epistemic-share decomposition"); ax[1].legend(fontsize=7)
         ax[2].plot(A[:, 0], A[:, 5], "-o", ms=3, label="SNN H")
         ax[2].plot(A[:, 0], A[:, 6], "-s", ms=3, label="MCD H")
-        ax[2].plot(A[:, 0], A[:, 10], "-^", ms=3, label="EDL H")
+        ax[2].plot(A[:, 0], A[:, 13], "-^", ms=3, label="EDL H")
         ax[2].set_title("Entropy comparison"); ax[2].legend(fontsize=8)
         for a in ax: a.set_xlabel("rotation (deg)")
         fig.tight_layout()
@@ -316,6 +415,10 @@ def build_argparser():
     ap.add_argument("--rot_step", type=int, default=15)
     ap.add_argument("--rot_n", type=int, default=1000, help="test digits per angle")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--n_train", type=int, default=60000,
+                    help="Cap training set size (sub-samples randomly; default=all)")
+    ap.add_argument("--label_noise", type=float, default=0.0,
+                    help="Fraction of training labels to randomly flip (aleatoric probe)")
     ap.add_argument("--no-cache", action="store_true", dest="no_cache",
                     help="Retrain and re-run inference from scratch")
     return ap
