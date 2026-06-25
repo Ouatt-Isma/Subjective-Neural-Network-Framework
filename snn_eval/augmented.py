@@ -65,6 +65,37 @@ def _cat_entropy(p):
     return -(p * p.clamp_min(EPS).log()).sum(-1)
 
 
+def bald_split(samples):
+    """samples: (B, T, K) categorical distributions (or empirical frequency
+    vectors) along any flat ensemble axis T -- nested-sampling outer draws,
+    MC Dropout forward passes, deep-ensemble members, etc.
+
+    Returns (H_total, eH, MI, u): predictive entropy decomposed via mutual
+    information between the ensemble-member index and the predicted class
+    (Houlsby BALD / Depeweg 2018) -- H_total = eH (aleatoric) + MI (epistemic),
+    u = MI / H_total (epistemic share).
+    """
+    mean = samples.mean(dim=1)                                      # (B,K)
+    H_total = _cat_entropy(mean)                                    # (B,)
+    eH = _cat_entropy(samples).mean(dim=1)                          # (B,)
+    MI = (H_total - eH).clamp_min(0.0)                              # (B,)
+    u = torch.where(H_total > 0,
+                     (MI / H_total.clamp_min(EPS)).clamp(max=1.0),
+                     torch.zeros_like(H_total))
+    return H_total, eH, MI, u
+
+
+def bald_opinion(samples):
+    """samples: (B, T, K) softmax draws from a flat ensemble (e.g. MC Dropout
+    forward passes). Same entropy/MI split as augmented_opinion (bald_split)
+    without the nested trust structure or Dirichlet-opinion fitting -- there's
+    no prior/belief-direction step here, just the prior-free entropy split.
+    """
+    H_total, eH, MI, u = bald_split(samples)
+    return dict(probs=samples.mean(dim=1), u=u, u_e=MI, u_a=eH,
+                H_total=H_total, eH=eH, MI=MI, H=H_total)
+
+
 def augmented_opinion(raw, prior=1.0, mode="counts"):
     """raw: (B, Np, Nm, K). Returns dict of augmented (BALD) SL quantities.
 
@@ -77,14 +108,7 @@ def augmented_opinion(raw, prior=1.0, mode="counts"):
     counts, raw_mean, mean = per_sample_dirichlets(raw, prior, mode)
 
     grand_mean = mean.mean(dim=1)                                  # (B,K) prior-smoothed
-    raw_grand_mean = raw_mean.mean(dim=1)                          # (B,K) prior-free
-
-    H_total = _cat_entropy(raw_grand_mean)                         # (B,)
-    eH = _cat_entropy(raw_mean).mean(dim=1)                        # (B,)
-    MI = (H_total - eH).clamp_min(0.0)                             # (B,)
-    u = torch.where(H_total > 0,
-                     (MI / H_total.clamp_min(EPS)).clamp(max=1.0),
-                     torch.zeros_like(H_total))
+    H_total, eH, MI, u = bald_split(raw_mean)
 
     b = (1 - u).unsqueeze(1) * grand_mean
     P = b + (u / K).unsqueeze(1)
