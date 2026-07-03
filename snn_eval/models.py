@@ -309,9 +309,13 @@ def recalibrate_bn(model, X, device="cpu", bs=512):
 
 def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
                beta_max=5.0, warmup_frac=0.1, is_snn=False, is_edl=False,
-               edl_lam=1.0, device="cpu", verbose=False, Xte=None, yte=None):
+               edl_lam=1.0, device="cpu", verbose=False, Xte=None, yte=None,
+               weight_decay=0.0, augment_fn=None, cosine_schedule=False):
     model.to(device).train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = None
+    if cosine_schedule:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     n = Xtr.shape[0]
     n_train = float(n)
     steps = max(1, n // bs)
@@ -324,6 +328,8 @@ def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
         for i in tqdm(range(0, n - bs + 1, bs), desc=f"Epoch {ep+1}/{epochs}", disable=not verbose):
             idx = perm[i:i + bs]
             xb, yb = Xtr[idx].to(device), ytr[idx].to(device)
+            if augment_fn is not None:
+                xb = augment_fn(xb)
             opt.zero_grad()
             if is_edl:
                 eta = model(xb)
@@ -364,6 +370,8 @@ def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
             if is_edl:
                 msg += f" lam={lam_t:.2f}"
             print(msg, flush=True)
+        if scheduler is not None:
+            scheduler.step()
     if is_edl:
         recalibrate_bn(model, Xtr, device=device)
     model.eval()
