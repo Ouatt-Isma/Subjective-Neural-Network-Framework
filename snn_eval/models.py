@@ -176,30 +176,31 @@ class _ResBlock(nn.Module):
 
 
 class _CNNBackbone(nn.Module):
-    """LeNet-style: three conv layers + pool -> (N, d_out). Input (N,1,28,28)."""
+    """LeNet-style: three conv layers + pool -> (N, d_out)."""
 
-    def __init__(self, d_out):
+    def __init__(self, d_out, in_channels=1, input_size=28):
         super().__init__()
         self.convs = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(in_channels, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.MaxPool2d(2),                      # 28x28 -> 14x14
+            nn.MaxPool2d(2),
             nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.MaxPool2d(2),                      # 14x14 -> 7x7
+            nn.MaxPool2d(2),
         )
-        self.fc = nn.Linear(64 * 7 * 7, d_out)
+        pool_size = input_size // 4
+        self.fc = nn.Linear(64 * pool_size * pool_size, d_out)
 
     def forward(self, x):
         return F.relu(self.fc(self.convs(x).flatten(1)))
 
 
 class _TinyResNet(nn.Module):
-    """4-block residual net with global avg pool -> (N, d_out). Input (N,1,28,28)."""
+    """4-block residual net with global avg pool -> (N, d_out)."""
 
-    def __init__(self, d_out):
+    def __init__(self, d_out, in_channels=1):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(in_channels, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.ReLU(),
         )
         self.stage1 = nn.Sequential(_ResBlock(32), _ResBlock(32))
         self.down1 = nn.Sequential(
@@ -219,9 +220,9 @@ class _TinyResNet(nn.Module):
         return F.relu(self.fc(self.pool(x).flatten(1)))
 
 
-def _make_backbone(arch, d_out):
-    if arch == "cnn":    return _CNNBackbone(d_out)
-    if arch == "resnet": return _TinyResNet(d_out)
+def _make_backbone(arch, d_out, in_channels=1, input_size=28):
+    if arch == "cnn":    return _CNNBackbone(d_out, in_channels=in_channels, input_size=input_size)
+    if arch == "resnet": return _TinyResNet(d_out, in_channels=in_channels)
     raise ValueError(f"unknown arch {arch!r}; expected 'cnn' or 'resnet'")
 
 
@@ -229,9 +230,10 @@ class SubjectiveCNN(nn.Module):
     """SNN with CNN or ResNet image backbone. Same external interface as SubjectiveHead."""
 
     def __init__(self, arch, d_hidden, n_classes,
-                 prior_a=7.0, prior_b=3.0, init_keep=0.7, tau=0.5):
+                 prior_a=7.0, prior_b=3.0, init_keep=0.7, tau=0.5,
+                 in_channels=1, input_size=28):
         super().__init__()
-        self.backbone = _make_backbone(arch, d_hidden)
+        self.backbone = _make_backbone(arch, d_hidden, in_channels=in_channels, input_size=input_size)
         self.head = SubjectiveHead(d_hidden, d_hidden, n_classes,
                                    prior_a=prior_a, prior_b=prior_b,
                                    init_keep=init_keep, tau=tau)
@@ -254,9 +256,10 @@ class SubjectiveCNN(nn.Module):
 class MCDropoutCNN(nn.Module):
     """MC Dropout with CNN or ResNet image backbone."""
 
-    def __init__(self, arch, d_hidden, n_classes, p_drop=0.5):
+    def __init__(self, arch, d_hidden, n_classes, p_drop=0.5,
+                 in_channels=1, input_size=28):
         super().__init__()
-        self.backbone = _make_backbone(arch, d_hidden)
+        self.backbone = _make_backbone(arch, d_hidden, in_channels=in_channels, input_size=input_size)
         self.head = MCDropoutHead(d_hidden, d_hidden, n_classes, p_drop=p_drop)
 
     def forward(self, x, sample=False):
@@ -266,9 +269,10 @@ class MCDropoutCNN(nn.Module):
 class EDLCNN(nn.Module):
     """EDL with CNN or ResNet image backbone."""
 
-    def __init__(self, arch, d_hidden, n_classes):
+    def __init__(self, arch, d_hidden, n_classes,
+                 in_channels=1, input_size=28):
         super().__init__()
-        self.backbone = _make_backbone(arch, d_hidden)
+        self.backbone = _make_backbone(arch, d_hidden, in_channels=in_channels, input_size=input_size)
         self.head = EDLHead(d_hidden, d_hidden, n_classes)
         self.n_classes = n_classes
 
