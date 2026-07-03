@@ -220,10 +220,62 @@ class _TinyResNet(nn.Module):
         return F.relu(self.fc(self.pool(x).flatten(1)))
 
 
+# -- WideResNet (Zagoruyko & Komodakis 2016) ------------------------------
+class _WRNBlock(nn.Module):
+    """Pre-activation wide residual block."""
+
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.bn1 = nn.BatchNorm2d(in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False)
+
+    def forward(self, x):
+        out = self.conv1(F.relu(self.bn1(x)))
+        out = self.conv2(F.relu(self.bn2(out)))
+        return out + self.shortcut(x)
+
+
+class _WideResNet(nn.Module):
+    """WideResNet-depth-widen backbone -> (N, d_out). Default: WRN-28-10."""
+
+    def __init__(self, d_out, depth=28, widen_factor=10, in_channels=3):
+        super().__init__()
+        assert (depth - 4) % 6 == 0
+        n = (depth - 4) // 6
+        ch = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
+        self.conv1 = nn.Conv2d(in_channels, ch[0], 3, padding=1, bias=False)
+        self.group1 = self._make_group(ch[0], ch[1], n, stride=1)
+        self.group2 = self._make_group(ch[1], ch[2], n, stride=2)
+        self.group3 = self._make_group(ch[2], ch[3], n, stride=2)
+        self.bn = nn.BatchNorm2d(ch[3])
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(ch[3], d_out)
+
+    @staticmethod
+    def _make_group(in_ch, out_ch, n_blocks, stride):
+        layers = [_WRNBlock(in_ch, out_ch, stride)]
+        for _ in range(1, n_blocks):
+            layers.append(_WRNBlock(out_ch, out_ch, 1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.group3(self.group2(self.group1(out)))
+        out = F.relu(self.bn(out))
+        out = self.pool(out).flatten(1)
+        return self.fc(out)
+
+
 def _make_backbone(arch, d_out, in_channels=1, input_size=28):
     if arch == "cnn":    return _CNNBackbone(d_out, in_channels=in_channels, input_size=input_size)
     if arch == "resnet": return _TinyResNet(d_out, in_channels=in_channels)
-    raise ValueError(f"unknown arch {arch!r}; expected 'cnn' or 'resnet'")
+    if arch == "wrn":    return _WideResNet(d_out, depth=28, widen_factor=10, in_channels=in_channels)
+    raise ValueError(f"unknown arch {arch!r}; expected 'cnn', 'resnet', or 'wrn'")
 
 
 class SubjectiveCNN(nn.Module):
@@ -309,9 +361,18 @@ def recalibrate_bn(model, X, device="cpu", bs=512):
 
 def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
                beta_max=5.0, warmup_frac=0.1, is_snn=False, is_edl=False,
-               edl_lam=1.0, device="cpu", verbose=False, Xte=None, yte=None):
+               edl_lam=1.0, device="cpu", verbose=False, Xte=None, yte=None,
+               weight_decay=0.0, augment_fn=None, cosine_schedule=False,
+               use_sgd=False, momentum=0.9):
     model.to(device).train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    if use_sgd:
+        opt = torch.optim.SGD(model.parameters(), lr=lr,
+                              momentum=momentum, weight_decay=weight_decay)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = None
+    if cosine_schedule:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     n = Xtr.shape[0]
     n_train = float(n)
     steps = max(1, n // bs)
@@ -324,6 +385,8 @@ def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
         for i in tqdm(range(0, n - bs + 1, bs), desc=f"Epoch {ep+1}/{epochs}", disable=not verbose):
             idx = perm[i:i + bs]
             xb, yb = Xtr[idx].to(device), ytr[idx].to(device)
+            if augment_fn is not None:
+                xb = augment_fn(xb)
             opt.zero_grad()
             if is_edl:
                 eta = model(xb)
@@ -364,6 +427,8 @@ def train_head(model, Xtr, ytr, n_classes, *, epochs=15, lr=1e-3, bs=64,
             if is_edl:
                 msg += f" lam={lam_t:.2f}"
             print(msg, flush=True)
+        if scheduler is not None:
+            scheduler.step()
     if is_edl:
         recalibrate_bn(model, Xtr, device=device)
     model.eval()
